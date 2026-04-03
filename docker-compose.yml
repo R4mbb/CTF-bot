@@ -1,0 +1,17 @@
+version: "3.8"
+
+services:
+  ctfbot:
+    build: .
+    env_file: .env
+    volumes:
+      - ctfbot-data:/app/data
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  ctfbot-data:
