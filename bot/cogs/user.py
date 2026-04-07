@@ -139,9 +139,19 @@ class InitModal(discord.ui.Modal, title="Team Registration"):
         placeholder="e.g. gildong",
         max_length=32,
     )
+    phone_input = discord.ui.TextInput(
+        label="Phone (전화번호)",
+        placeholder="e.g. 010-1234-5678",
+        max_length=20,
+    )
     email_input = discord.ui.TextInput(
         label="Email (이메일)",
         placeholder="e.g. gildong@example.com",
+        max_length=200,
+    )
+    affiliation_input = discord.ui.TextInput(
+        label="Affiliation (소속 - 학교/직장 등)",
+        placeholder="e.g. 서울대학교 / ABC Corp",
         max_length=200,
     )
 
@@ -159,7 +169,9 @@ class InitModal(discord.ui.Modal, title="Team Registration"):
 
         name = str(self.name_input).strip()
         nickname = str(self.nickname_input).strip()
+        phone = str(self.phone_input).strip()
         email = str(self.email_input).strip()
+        affiliation = str(self.affiliation_input).strip()
 
         team_role = get_team_role(guild, self.config.team_role_name)
         already_member = team_role in member.roles if team_role else False
@@ -191,7 +203,9 @@ class InitModal(discord.ui.Modal, title="Team Registration"):
             )
             info_embed.add_field(name="Name", value=name, inline=True)
             info_embed.add_field(name="Nickname", value=nickname, inline=True)
+            info_embed.add_field(name="Phone", value=phone, inline=True)
             info_embed.add_field(name="Email", value=email, inline=True)
+            info_embed.add_field(name="Affiliation", value=affiliation, inline=True)
             info_embed.add_field(name="Discord", value=f"{member.mention} (`{member}`)", inline=False)
             info_embed.set_thumbnail(url=member.display_avatar.url)
             try:
@@ -203,24 +217,25 @@ class InitModal(discord.ui.Modal, title="Team Registration"):
         async with get_session() as session:
             await audit.log_action(
                 session, guild.id, member.id, "init",
-                f"Registered: {name} / {nickname} / {email}",
+                f"Registered: {name} / {nickname} / {phone} / {email} / {affiliation}",
             )
 
         await send_log(guild, member, "init", f"Registered as **{nickname}** ({name})")
 
+        info_summary = (
+            f"**Name:** {name}\n**Nickname:** {nickname}\n**Phone:** {phone}\n"
+            f"**Email:** {email}\n**Affiliation:** {affiliation}"
+        )
+
         if already_member:
             await interaction.followup.send(
-                embed=success_embed(
-                    f"Your info has been updated.\n"
-                    f"**Name:** {name}\n**Nickname:** {nickname}\n**Email:** {email}"
-                ),
+                embed=success_embed(f"Your info has been updated.\n{info_summary}"),
                 ephemeral=True,
             )
         else:
             await interaction.followup.send(
                 embed=success_embed(
-                    f"Welcome to the team! You now have the **{self.config.team_role_name}** role.\n"
-                    f"**Name:** {name}\n**Nickname:** {nickname}\n**Email:** {email}"
+                    f"Welcome to the team! You now have the **{self.config.team_role_name}** role.\n{info_summary}"
                 ),
                 ephemeral=True,
             )
