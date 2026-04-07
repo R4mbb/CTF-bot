@@ -12,7 +12,11 @@ from bot.db import get_session
 from bot.services import ctf_service, audit
 from bot.services.discord_service import (
     create_challenge_channel,
+    create_init_channel,
+    delete_init_channel,
+    get_admin_role,
     get_channel_by_name,
+    get_team_role,
     grant_user_access,
     mark_channel_solved,
     revoke_user_access,
@@ -67,6 +71,11 @@ HELP_EMBED = discord.Embed(
     color=0x5865F2,
 )
 HELP_EMBED.add_field(
+    name="\U0001f4dd  Team Registration",
+    value="`/init` \u2014 Open registration form (private popup)",
+    inline=False,
+)
+HELP_EMBED.add_field(
     name="\U0001f3ae  CTF Participation",
     value=(
         "`/join_ctf <ctf_name>` \u2014 Join a CTF, unlock channels\n"
@@ -117,16 +126,146 @@ HELP_EMBED.add_field(
 HELP_EMBED.set_footer(text="CTF Bot  \u2502  /help for this guide")
 
 
+# ── Init Modal (private popup form) ─────────────────────────────────────
+
+class InitModal(discord.ui.Modal, title="Team Registration"):
+    name_input = discord.ui.TextInput(
+        label="Name (이름)",
+        placeholder="e.g. 홍길동",
+        max_length=100,
+    )
+    nickname_input = discord.ui.TextInput(
+        label="Nickname (닉네임)",
+        placeholder="e.g. gildong",
+        max_length=32,
+    )
+    email_input = discord.ui.TextInput(
+        label="Email (이메일)",
+        placeholder="e.g. gildong@example.com",
+        max_length=200,
+    )
+
+    def __init__(self, config: Config):
+        super().__init__()
+        self.config = config
+
+    async def on_submit(self, interaction: discord.Interaction):
+        guild = interaction.guild
+        member = interaction.user
+        if not guild or not isinstance(member, discord.Member):
+            return
+
+        await interaction.response.defer(ephemeral=True)
+
+        name = str(self.name_input).strip()
+        nickname = str(self.nickname_input).strip()
+        email = str(self.email_input).strip()
+
+        team_role = get_team_role(guild, self.config.team_role_name)
+        already_member = team_role in member.roles if team_role else False
+
+        # Assign team role if not already assigned
+        if team_role and not already_member:
+            try:
+                await member.add_roles(team_role, reason="CTF Bot: /init registration")
+            except discord.HTTPException as exc:
+                logger.warning("Failed to assign team role to %s: %s", member, exc)
+                await interaction.followup.send(
+                    embed=error_embed("Failed to assign team role. Please contact an admin."),
+                    ephemeral=True,
+                )
+                return
+
+        # Set Discord nickname
+        try:
+            await member.edit(nick=nickname, reason="CTF Bot: /init registration")
+        except discord.HTTPException:
+            logger.warning("Failed to set nickname for %s (may lack permission for owner)", member)
+
+        # Post member info to Admin category's "team" channel
+        team_channel = discord.utils.get(guild.text_channels, name="team")
+        if team_channel:
+            info_embed = discord.Embed(
+                title="\U0001f4dd  New Member Registered" if not already_member else "\U0001f4dd  Member Info Updated",
+                color=0x57F287 if not already_member else 0x5865F2,
+            )
+            info_embed.add_field(name="Name", value=name, inline=True)
+            info_embed.add_field(name="Nickname", value=nickname, inline=True)
+            info_embed.add_field(name="Email", value=email, inline=True)
+            info_embed.add_field(name="Discord", value=f"{member.mention} (`{member}`)", inline=False)
+            info_embed.set_thumbnail(url=member.display_avatar.url)
+            try:
+                await team_channel.send(embed=info_embed)
+            except discord.HTTPException:
+                pass
+
+        # Audit log
+        async with get_session() as session:
+            await audit.log_action(
+                session, guild.id, member.id, "init",
+                f"Registered: {name} / {nickname} / {email}",
+            )
+
+        await send_log(guild, member, "init", f"Registered as **{nickname}** ({name})")
+
+        if already_member:
+            await interaction.followup.send(
+                embed=success_embed(
+                    f"Your info has been updated.\n"
+                    f"**Name:** {name}\n**Nickname:** {nickname}\n**Email:** {email}"
+                ),
+                ephemeral=True,
+            )
+        else:
+            await interaction.followup.send(
+                embed=success_embed(
+                    f"Welcome to the team! You now have the **{self.config.team_role_name}** role.\n"
+                    f"**Name:** {name}\n**Nickname:** {nickname}\n**Email:** {email}"
+                ),
+                ephemeral=True,
+            )
+
+            # Delete the private init channel after successful registration
+            await delete_init_channel(guild, member)
+
+
 class UserCog(commands.Cog):
     def __init__(self, bot: commands.Bot, config: Config):
         self.bot = bot
         self.config = config
+
+    # ── Private init channel per new member ─────────────────────────────
+
+    @commands.Cog.listener()
+    async def on_member_join(self, member: discord.Member):
+        """Create a private #init-{username} channel when a new member joins."""
+        guild = member.guild
+        team_role = get_team_role(guild, self.config.team_role_name)
+
+        # Skip if the member already has the team role (e.g. re-join)
+        if team_role and team_role in member.roles:
+            return
+
+        try:
+            admin_role = get_admin_role(guild, self.config.admin_role_name)
+            await create_init_channel(guild, member, admin_role)
+        except Exception:
+            logger.exception("Failed to create init channel for %s in guild %s", member, guild.id)
 
     # ── /help ─────────────────────────────────────────────────────────────
 
     @app_commands.command(name="help", description="Show command usage guide")
     async def help_cmd(self, interaction: discord.Interaction):
         await interaction.response.send_message(embed=HELP_EMBED, ephemeral=True)
+
+    # ── /init ─────────────────────────────────────────────────────────────
+
+    @app_commands.command(
+        name="init",
+        description="Register as a team member (opens a private form)",
+    )
+    async def init_member(self, interaction: discord.Interaction):
+        await interaction.response.send_modal(InitModal(self.config))
 
     # ── /join_ctf ─────────────────────────────────────────────────────────
 

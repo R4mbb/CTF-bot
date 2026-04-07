@@ -98,17 +98,23 @@ async def revoke_user_access(
 async def make_category_public(
     category: discord.CategoryChannel,
     guild: discord.Guild,
+    team_role: discord.Role | None = None,
 ) -> None:
-    """Make a CTF category visible to everyone (archive/end-of-CTF)."""
+    """Make a CTF category visible after CTF ends.
+
+    If team_role is provided, visibility is granted to that role only (read-only).
+    Otherwise falls back to @everyone.
+    """
+    target = team_role or guild.default_role
     overwrite = discord.PermissionOverwrite(view_channel=True, send_messages=False)
     await category.set_permissions(
-        guild.default_role, overwrite=overwrite, reason="CTF Bot: CTF ended, archiving"
+        target, overwrite=overwrite, reason="CTF Bot: CTF ended, archiving"
     )
     for channel in category.channels:
         await channel.set_permissions(
-            guild.default_role, overwrite=overwrite, reason="CTF Bot: CTF ended, archiving"
+            target, overwrite=overwrite, reason="CTF Bot: CTF ended, archiving"
         )
-    logger.info("Made category '%s' public in guild %s", category.name, guild.id)
+    logger.info("Made category '%s' visible to %s in guild %s", category.name, target.name, guild.id)
 
 
 async def delete_category_and_channels(category: discord.CategoryChannel) -> None:
@@ -121,6 +127,85 @@ async def delete_category_and_channels(category: discord.CategoryChannel) -> Non
 
 def get_admin_role(guild: discord.Guild, role_name: str) -> discord.Role | None:
     return discord.utils.get(guild.roles, name=role_name)
+
+
+def get_team_role(guild: discord.Guild, role_name: str) -> discord.Role | None:
+    return discord.utils.get(guild.roles, name=role_name)
+
+
+INIT_CHANNEL_PREFIX = "init-"
+
+INIT_WELCOME_MESSAGE = (
+    "## Welcome!\n\n"
+    "This is your private registration channel.\n"
+    "Type `/init` below to open the registration form.\n\n"
+    "Your information is entered through a **private popup** — "
+    "no one else can see what you type.\n\n"
+    "After registration, this channel will be automatically deleted "
+    "and you will gain access to all team channels."
+)
+
+
+async def create_init_channel(
+    guild: discord.Guild,
+    member: discord.Member,
+    admin_role: discord.Role | None,
+) -> discord.TextChannel:
+    """Create a private #init-{username} channel visible only to the member and admins.
+
+    Returns the created channel.
+    """
+    overwrites: dict[discord.Role | discord.Member, discord.PermissionOverwrite] = {
+        guild.default_role: discord.PermissionOverwrite(view_channel=False),
+        member: discord.PermissionOverwrite(
+            view_channel=True,
+            send_messages=True,
+        ),
+    }
+    if admin_role:
+        overwrites[admin_role] = discord.PermissionOverwrite(
+            view_channel=True,
+            manage_channels=True,
+            manage_messages=True,
+        )
+    if guild.me:
+        overwrites[guild.me] = discord.PermissionOverwrite(
+            view_channel=True,
+            manage_channels=True,
+            manage_messages=True,
+        )
+
+    ch_name = f"{INIT_CHANNEL_PREFIX}{member.name}"
+    channel = await guild.create_text_channel(
+        name=ch_name,
+        overwrites=overwrites,
+        topic=f"Private registration channel for {member.display_name}",
+        reason=f"CTF Bot: init channel for {member}",
+    )
+    await channel.send(f"{member.mention}\n\n{INIT_WELCOME_MESSAGE}")
+    logger.info("Created private init channel #%s for %s in guild %s", ch_name, member, guild.id)
+    return channel
+
+
+async def delete_init_channel(
+    guild: discord.Guild,
+    member: discord.Member,
+) -> bool:
+    """Delete the private #init-{username} channel after registration.
+
+    Returns True if a channel was deleted.
+    """
+    ch_name = f"{INIT_CHANNEL_PREFIX}{member.name}".lower().replace(" ", "-")
+    for ch in guild.text_channels:
+        if ch.name == ch_name:
+            try:
+                await ch.delete(reason=f"CTF Bot: {member} completed /init registration")
+                logger.info("Deleted init channel #%s in guild %s", ch_name, guild.id)
+                return True
+            except discord.HTTPException as exc:
+                logger.warning("Failed to delete init channel #%s: %s", ch_name, exc)
+                return False
+    return False
 
 
 def get_channel_by_name(

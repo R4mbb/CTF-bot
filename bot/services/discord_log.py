@@ -21,6 +21,7 @@ ACTION_ICONS = {
     "reload_ctfbot": "\U0001f504",  # arrows
     "create_ctf_from_ctftime": "\U0001f310",  # globe
     "archive_ctf": "\U0001f4e6",    # package
+    "init": "\U0001f4dd",            # memo
 }
 
 

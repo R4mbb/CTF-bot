@@ -12,7 +12,7 @@ from bot.db import get_session
 from bot.integrations.ctftime import CTFTimeClient
 from bot.models.ctf import CTF, CTFStatus
 from bot.services.ctf_service import get_ended_ctfs_needing_archive
-from bot.services.discord_service import make_category_public
+from bot.services.discord_service import get_team_role, make_category_public
 from bot.services.discord_log import send_log
 from bot.utils.embeds import ctftime_events_embed
 
@@ -26,12 +26,14 @@ class CTFScheduler:
         interval_minutes: int = 5,
         announcement_channel: str | None = None,
         ctftime_cache_ttl: int = 1800,
+        team_role_name: str = "팀원",
     ):
         self._bot = bot
         self._scheduler = AsyncIOScheduler()
         self._interval = interval_minutes
         self._announcement_channel = announcement_channel
         self._ctftime_client = CTFTimeClient(cache_ttl=ctftime_cache_ttl)
+        self._team_role_name = team_role_name
 
     def start(self) -> None:
         self._scheduler.add_job(
@@ -92,7 +94,8 @@ class CTFScheduler:
             return
 
         try:
-            await make_category_public(category, guild)
+            team_role = get_team_role(guild, self._team_role_name)
+            await make_category_public(category, guild, team_role=team_role)
             ctf.status = CTFStatus.ARCHIVED
             logger.info("Archived CTF '%s' in guild %d", ctf.name, ctf.guild_id)
             await send_log(guild, None, "archive_ctf", f"Auto-archived **{ctf.name}** (CTF ended)")

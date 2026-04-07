@@ -20,6 +20,9 @@ class Config:
     admin_role_name: str = field(
         default_factory=lambda: os.getenv("ADMIN_ROLE_NAME", "CTF Admin")
     )
+    team_role_name: str = field(
+        default_factory=lambda: os.getenv("TEAM_ROLE_NAME", "팀원")
+    )
     log_level: str = field(default_factory=lambda: os.getenv("LOG_LEVEL", "INFO"))
     timezone: str = field(default_factory=lambda: os.getenv("TIMEZONE", "UTC"))
     ctftime_cache_ttl: int = field(
