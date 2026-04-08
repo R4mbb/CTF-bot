@@ -96,7 +96,7 @@ class CreateCTFModal(discord.ui.Modal, title="Create New CTF"):
             )
             return
 
-        await interaction.response.defer(ephemeral=True)
+        await interaction.response.defer(ephemeral=True, thinking=True)
 
         guild = interaction.guild
         assert guild is not None

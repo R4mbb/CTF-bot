@@ -165,7 +165,7 @@ class InitModal(discord.ui.Modal, title="Team Registration"):
         if not guild or not isinstance(member, discord.Member):
             return
 
-        await interaction.response.defer(ephemeral=True)
+        await interaction.response.defer(ephemeral=True, thinking=True)
 
         name = str(self.name_input).strip()
         nickname = str(self.nickname_input).strip()
