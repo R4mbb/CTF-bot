@@ -1,7 +1,66 @@
+# Python build artifacts
 __pycache__
 *.pyc
-.env
-.git
-data/
-.venv/
+*.pyo
 *.egg-info
+build/
+dist/
+
+# Virtual envs
+.venv/
+venv/
+env/
+
+# Secrets & local-only state
+.env
+.env.local
+.env.*.local
+.env.production
+.env.development
+.env.test
+
+# Source control
+.git
+.gitignore
+
+# Local databases (SQLite + WAL sidecars)
+data/
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+
+# Local docker overrides
+docker-compose.override.yml
+docker-compose.override.yaml
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# Testing / coverage
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.mypy_cache/
+.tox/
+.nox/
+.ruff_cache/
+
+# Logs / scratch / personal
+*.log
+logs/
+notes/
+scratch/
+.scratch/
+tmp/
+*.bak
+*.orig
+
+# Claude Code
+.claude/
+CLAUDE.local.md

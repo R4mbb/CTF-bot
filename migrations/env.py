@@ -1,7 +1,20 @@
+"""Alembic env: works with both sync (sqlite) and async (asyncpg) URLs.
+
+Picks up ``DATABASE_URL`` from the environment so the same env var drives the
+runtime app and the migration CLI. For Postgres we use the asyncpg driver via
+``run_sync`` against an async engine, which avoids needing a separate sync
+driver in production.
+"""
+from __future__ import annotations
+
+import asyncio
+import os
 from logging.config import fileConfig
 
 from alembic import context
 from sqlalchemy import engine_from_config, pool
+from sqlalchemy.engine import Connection
+from sqlalchemy.ext.asyncio import async_engine_from_config
 
 from bot.models.base import Base
 
@@ -9,7 +22,16 @@ config = context.config
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 
+# Allow the same DATABASE_URL the bot uses to drive migrations.
+_env_url = os.getenv("DATABASE_URL")
+if _env_url:
+    config.set_main_option("sqlalchemy.url", _env_url)
+
 target_metadata = Base.metadata
+
+
+def _is_async_url(url: str) -> bool:
+    return "+asyncpg" in url or "+aiosqlite" in url
 
 
 def run_migrations_offline() -> None:
@@ -19,16 +41,37 @@ def run_migrations_offline() -> None:
         context.run_migrations()
 
 
+def _do_run_migrations(connection: Connection) -> None:
+    context.configure(connection=connection, target_metadata=target_metadata)
+    with context.begin_transaction():
+        context.run_migrations()
+
+
+async def _run_async_migrations() -> None:
+    connectable = async_engine_from_config(
+        config.get_section(config.config_ini_section, {}),
+        prefix="sqlalchemy.",
+        poolclass=pool.NullPool,
+    )
+    async with connectable.connect() as connection:
+        await connection.run_sync(_do_run_migrations)
+    await connectable.dispose()
+
+
 def run_migrations_online() -> None:
+    url = config.get_main_option("sqlalchemy.url")
+    if _is_async_url(url):
+        asyncio.run(_run_async_migrations())
+        return
+
+    # Sync path (e.g. plain ``sqlite:///`` or ``postgresql://`` without asyncpg).
     connectable = engine_from_config(
         config.get_section(config.config_ini_section, {}),
         prefix="sqlalchemy.",
         poolclass=pool.NullPool,
     )
     with connectable.connect() as connection:
-        context.configure(connection=connection, target_metadata=target_metadata)
-        with context.begin_transaction():
-            context.run_migrations()
+        _do_run_migrations(connection)
 
 
 if context.is_offline_mode():

@@ -23,6 +23,7 @@ class Challenge(Base):
     notes: Mapped[str | None] = mapped_column(Text, nullable=True)
     added_by: Mapped[int] = mapped_column(BigInteger)
     solved: Mapped[bool] = mapped_column(default=False)
+    channel_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
     )

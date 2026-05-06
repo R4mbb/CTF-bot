@@ -33,6 +33,8 @@ class CTF(Base):
 
     # Discord resource IDs
     category_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    role_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    announcement_message_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
 
     # Soft delete
     deleted: Mapped[bool] = mapped_column(Boolean, default=False)

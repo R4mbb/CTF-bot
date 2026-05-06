@@ -7,36 +7,83 @@ __pycache__/
 dist/
 build/
 *.egg
+pip-log.txt
 
 # Virtual environment
 .venv/
 venv/
 env/
 
-# Environment variables
+# Environment variables — keep .env.example tracked, ignore everything else
 .env
+.env.local
+.env.*.local
+.env.production
+.env.development
+.env.test
+!.env.example
 
-# Database
+# Database files (SQLite + WAL/journal sidecars)
 data/
 *.db
+*.db-journal
+*.db-wal
+*.db-shm
+*.sqlite
 *.sqlite3
+*.sqlite-journal
 
-# IDE
+# Local docker-compose overrides (often hold real credentials)
+docker-compose.override.yml
+docker-compose.override.yaml
+compose.override.yml
+compose.override.yaml
+
+# IDE / editor
 .vscode/
 .idea/
 *.swp
 *.swo
 *~
+*.code-workspace
+.history/
 
 # OS
 .DS_Store
 Thumbs.db
+Desktop.ini
 
-# Testing / Coverage
+# Testing / coverage
 .pytest_cache/
 .coverage
+.coverage.*
+coverage.xml
+*.cover
 htmlcov/
 .mypy_cache/
+.tox/
+.nox/
+.ruff_cache/
+
+# Logs
+*.log
+logs/
+
+# Backups / scratch / personal notes
+*.bak
+*.backup
+*.orig
+*.rej
+notes/
+scratch/
+.scratch/
+tmp/
+.tmp/
+
+# Profiling / debug dumps
+*.prof
+*.dmp
 
 # Claude Code
 .claude/
+CLAUDE.local.md

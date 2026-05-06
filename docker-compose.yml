@@ -1,11 +1,32 @@
-version: "3.8"
-
 services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-ctfbot}
+      POSTGRES_USER: ${POSTGRES_USER:-ctfbot}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-ctfbot}
+    volumes:
+      - ctfbot-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-ctfbot} -d ${POSTGRES_DB:-ctfbot}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
   ctfbot:
     build: .
     env_file: .env
+    environment:
+      # Override DATABASE_URL inside the compose network so the bot points at
+      # the postgres service regardless of what's in .env (which is normally
+      # set for local dev).
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-ctfbot}:${POSTGRES_PASSWORD:-ctfbot}@db:5432/${POSTGRES_DB:-ctfbot}
+    depends_on:
+      db:
+        condition: service_healthy
     volumes:
-      - ctfbot-data:/app/data
+      - ctfbot-data:/app/data  # retained for any local file artifacts
     restart: unless-stopped
     logging:
       driver: json-file
@@ -15,3 +36,4 @@ services:
 
 volumes:
   ctfbot-data:
+  ctfbot-pgdata:

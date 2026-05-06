@@ -2,7 +2,15 @@
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+
+KST = timezone(timedelta(hours=9), name="KST")
+
+
+def _parse_kst(value: str) -> datetime:
+    """Parse 'YYYY-MM-DD HH:MM' as KST and return a UTC-aware datetime."""
+    naive = datetime.strptime(value, "%Y-%m-%d %H:%M")
+    return naive.replace(tzinfo=KST).astimezone(timezone.utc)
 
 import discord
 from discord import app_commands
@@ -11,16 +19,28 @@ from discord.ext import commands
 from bot.config import Config
 from bot.db import get_session
 from bot.services import ctf_service, audit
+from bot.services.announcement import refresh_announcement_member_count
+from bot.services.archive import archive_ctf
 from bot.services.discord_service import (
+    assign_ctf_role,
     create_ctf_category,
+    create_ctf_role,
     delete_category_and_channels,
     delete_challenge_channel,
+    delete_ctf_role,
     get_admin_role,
     get_channel_by_name,
     grant_user_access,
 )
+from bot.models.ctf import CTFStatus
 from bot.services.discord_log import send_log
-from bot.utils.embeds import ctf_created_embed, error_embed, success_embed
+from bot.utils.embeds import (
+    ctf_announcement_embed,
+    ctf_created_embed,
+    error_embed,
+    fmt_kst,
+    success_embed,
+)
 from bot.utils.permissions import is_admin
 
 logger = logging.getLogger(__name__)
@@ -52,13 +72,13 @@ class CreateCTFModal(discord.ui.Modal, title="Create New CTF"):
         max_length=200,
     )
     start_time = discord.ui.TextInput(
-        label="Start Time (UTC)",
-        placeholder="2026-06-15 09:00",
+        label="Start Time (KST)",
+        placeholder="2026-06-15 18:00  (KST, 24h)",
         max_length=20,
     )
     end_time = discord.ui.TextInput(
-        label="End Time (UTC)",
-        placeholder="2026-06-17 09:00",
+        label="End Time (KST)",
+        placeholder="2026-06-17 18:00  (KST, 24h)",
         max_length=20,
     )
     ctftime_url = discord.ui.TextInput(
@@ -81,11 +101,11 @@ class CreateCTFModal(discord.ui.Modal, title="Create New CTF"):
 
     async def on_submit(self, interaction: discord.Interaction):
         try:
-            start_dt = datetime.strptime(str(self.start_time), "%Y-%m-%d %H:%M").replace(tzinfo=timezone.utc)
-            end_dt = datetime.strptime(str(self.end_time), "%Y-%m-%d %H:%M").replace(tzinfo=timezone.utc)
+            start_dt = _parse_kst(str(self.start_time))
+            end_dt = _parse_kst(str(self.end_time))
         except ValueError:
             await interaction.response.send_message(
-                embed=error_embed("Invalid time format. Use `YYYY-MM-DD HH:MM` (UTC)."),
+                embed=error_embed("Invalid time format. Use `YYYY-MM-DD HH:MM` (KST)."),
                 ephemeral=True,
             )
             return
@@ -136,8 +156,15 @@ async def _do_create_ctf(
             return None, 0
 
         admin_role = get_admin_role(guild, config.admin_role_name)
+
+        # Create the per-CTF participant role first so the category can
+        # reference it directly in its overwrites. If role creation fails,
+        # we still create the category — join/leave will fall back to
+        # per-member overwrites for backwards compatibility.
+        ctf_role = await create_ctf_role(guild, name)
+
         category, channels = await create_ctf_category(
-            guild, name, admin_role, config.default_channels
+            guild, name, admin_role, config.default_channels, ctf_role=ctf_role,
         )
 
         ctf = await ctf_service.create_ctf(
@@ -151,11 +178,40 @@ async def _do_create_ctf(
             visible_after_end=True,
             category_id=category.id,
         )
+        if ctf_role is not None:
+            await ctf_service.set_ctf_role(session, ctf.id, ctf_role.id)
+
+        # Auto-assign role + auto-insert membership for the creator. Without
+        # the membership row the creator has the role but couldn't /leave_ctf,
+        # and the participant counter would start at 0 even though they're
+        # clearly in the CTF.
+        if isinstance(actor, discord.Member):
+            await ctf_service.join_ctf(session, ctf.id, actor.id, guild.id)
+            if ctf_role is not None:
+                await assign_ctf_role(actor, ctf_role)
 
         await audit.log_action(
             session, guild.id, actor.id, "create_ctf",
             f"Created CTF '{name}' (id={ctf.id})",
         )
+
+        initial_member_count = await ctf_service.get_member_count(session, ctf.id)
+
+    # Post a welcome / info embed inside the CTF's own #announcements channel.
+    # Capture its message id so the participant counter can be updated live.
+    announce_ch = get_channel_by_name(category, "announcements")
+    if announce_ch is not None:
+        try:
+            announce_msg = await announce_ch.send(
+                embed=ctf_announcement_embed(ctf, member_count=initial_member_count)
+            )
+        except discord.HTTPException:
+            logger.warning("Failed to post announcement embed for CTF '%s'", name)
+        else:
+            async with get_session() as session:
+                await ctf_service.set_announcement_message(
+                    session, ctf.id, announce_msg.id
+                )
 
     # Post public join button to the guild-level #ctf-참여 channel
     ann_ch = discord.utils.get(guild.text_channels, name="ctf-참여")
@@ -163,7 +219,7 @@ async def _do_create_ctf(
         join_embed = discord.Embed(
             title=f"\U0001f3c1  {name}",
             description=(
-                f"**{discord.utils.format_dt(start_dt, 'f')}** \u2192 **{discord.utils.format_dt(end_dt, 'f')}**\n\n"
+                f"**{fmt_kst(start_dt)}** \u2192 **{fmt_kst(end_dt)}**\n\n"
                 + (f"{description}\n\n" if description else "")
                 + (f"[CTFTime]({ctftime_url})\n\n" if ctftime_url else "")
                 + "Click the button below to join and unlock all channels!"
@@ -212,15 +268,27 @@ class JoinCTFView(discord.ui.View):
                 )
                 return
 
-            if ctf.category_id:
-                category = guild.get_channel(ctf.category_id)
-                if isinstance(category, discord.CategoryChannel):
-                    await grant_user_access(category, member)
+            ctf_role_id = ctf.role_id
+            ctf_category_id = ctf.category_id
 
             await audit.log_action(
                 session, guild.id, member.id, "join_ctf",
                 f"Joined CTF '{self.ctf_name}' (via button)",
             )
+
+        ctf_role = guild.get_role(ctf_role_id) if ctf_role_id else None
+        if ctf_role is not None:
+            await assign_ctf_role(member, ctf_role)
+        elif ctf_category_id:
+            category = guild.get_channel(ctf_category_id)
+            if isinstance(category, discord.CategoryChannel):
+                await grant_user_access(category, member)
+
+        # Refresh the live participant counter on the announcement embed.
+        async with get_session() as session:
+            ctf_obj = await ctf_service.get_ctf_by_name(session, guild.id, self.ctf_name)
+            if ctf_obj is not None:
+                await refresh_announcement_member_count(guild, ctf_obj, session)
 
         await send_log(guild, member, "join_ctf", f"Joined **{self.ctf_name}**")
 
@@ -272,6 +340,10 @@ class ConfirmDeleteView(discord.ui.View):
                 if isinstance(category, discord.CategoryChannel):
                     await delete_category_and_channels(category)
 
+            # Delete the per-CTF role (if one was created for this CTF)
+            if ctf.role_id:
+                await delete_ctf_role(self.guild, ctf.role_id)
+
             await ctf_service.soft_delete_ctf(session, ctf)
 
             await audit.log_action(
@@ -318,8 +390,8 @@ class AdminCog(commands.Cog):
     @app_commands.command(name="create_ctf", description="Create a new CTF (admin only). No args = form UI.")
     @app_commands.describe(
         ctf_name="CTF name (skip all params to use the form UI)",
-        start_time="Start time UTC: YYYY-MM-DD HH:MM",
-        end_time="End time UTC: YYYY-MM-DD HH:MM",
+        start_time="Start time KST: YYYY-MM-DD HH:MM",
+        end_time="End time KST: YYYY-MM-DD HH:MM",
         description="Optional description",
         ctftime_url="Optional CTFTime URL",
     )
@@ -352,11 +424,11 @@ class AdminCog(commands.Cog):
             return
 
         try:
-            start_dt = datetime.strptime(start_time, "%Y-%m-%d %H:%M").replace(tzinfo=timezone.utc)
-            end_dt = datetime.strptime(end_time, "%Y-%m-%d %H:%M").replace(tzinfo=timezone.utc)
+            start_dt = _parse_kst(start_time)
+            end_dt = _parse_kst(end_time)
         except ValueError:
             await interaction.response.send_message(
-                embed=error_embed("Invalid time format. Use `YYYY-MM-DD HH:MM` (UTC)."),
+                embed=error_embed("Invalid time format. Use `YYYY-MM-DD HH:MM` (KST)."),
                 ephemeral=True,
             )
             return
@@ -505,6 +577,8 @@ class AdminCog(commands.Cog):
                 )
                 return
 
+            chall_channel_id = chall.channel_id
+
             await audit.log_action(
                 session, guild.id, interaction.user.id, "delete_challenge",
                 f"Deleted [{challenge_category}] {challenge_name} from '{ctf_name}'",
@@ -514,7 +588,10 @@ class AdminCog(commands.Cog):
         if ctf.category_id:
             category = guild.get_channel(ctf.category_id)
             if isinstance(category, discord.CategoryChannel):
-                await delete_challenge_channel(category, challenge_category, challenge_name)
+                await delete_challenge_channel(
+                    category, challenge_category, challenge_name,
+                    channel_id=chall_channel_id,
+                )
 
         await send_log(
             guild, interaction.user, "delete_challenge",
@@ -524,6 +601,67 @@ class AdminCog(commands.Cog):
         await interaction.followup.send(
             embed=success_embed(
                 f"Challenge **[{challenge_category.upper()}] {challenge_name}** deleted from **{ctf_name}**."
+            ),
+            ephemeral=True,
+        )
+
+    # ── /end_ctf ──────────────────────────────────────────────────────────
+
+    @app_commands.command(
+        name="end_ctf",
+        description="Manually end a CTF: post leaderboard, release role, lock channels (admin only)",
+    )
+    @app_commands.describe(ctf_name="Name of the CTF to end")
+    @app_commands.autocomplete(ctf_name=_ctf_name_autocomplete)
+    async def end_ctf(self, interaction: discord.Interaction, ctf_name: str):
+        if not is_admin(interaction, self.config):
+            await interaction.response.send_message(
+                embed=error_embed("Admin permission required."), ephemeral=True
+            )
+            return
+
+        guild = interaction.guild
+        assert guild is not None
+
+        await interaction.response.defer(ephemeral=True)
+
+        async with get_session() as session:
+            ctf = await ctf_service.get_ctf_by_name(session, guild.id, ctf_name)
+            if ctf is None:
+                await interaction.followup.send(
+                    embed=error_embed(f"CTF **{ctf_name}** not found."), ephemeral=True
+                )
+                return
+
+            if ctf.status == CTFStatus.ARCHIVED:
+                await interaction.followup.send(
+                    embed=error_embed(f"CTF **{ctf_name}** is already archived."),
+                    ephemeral=True,
+                )
+                return
+
+            await archive_ctf(
+                ctf, guild, session,
+                team_role_name=self.config.team_role_name,
+                reason=f"manual /end_ctf by {interaction.user}",
+            )
+
+            await audit.log_action(
+                session, guild.id, interaction.user.id, "end_ctf",
+                f"Manually ended CTF '{ctf_name}'",
+            )
+
+        await send_log(
+            guild, interaction.user, "end_ctf",
+            f"Ended **{ctf_name}** (leaderboard posted, role released, channels locked)",
+        )
+
+        await interaction.followup.send(
+            embed=success_embed(
+                f"**{ctf_name}** has been ended.\n"
+                "• Final leaderboard posted to `#scoreboard`\n"
+                "• End report posted to `#announcements`\n"
+                "• Participant role released and channels are now read-only"
             ),
             ephemeral=True,
         )
@@ -563,7 +701,7 @@ class AdminCog(commands.Cog):
 
     # ── /reload_ctfbot ────────────────────────────────────────────────────
 
-    @app_commands.command(name="reload_ctfbot", description="Reload bot extensions and config (admin only)")
+    @app_commands.command(name="reload_ctfbot", description="Reload bot extensions and resync slash commands (admin only)")
     async def reload_ctfbot(self, interaction: discord.Interaction):
         if not is_admin(interaction, self.config):
             await interaction.response.send_message(
@@ -583,7 +721,25 @@ class AdminCog(commands.Cog):
                 errors.append(f"`{ext_name}`: {exc}")
                 logger.error("Failed to reload %s: %s", ext_name, exc)
 
-        lines = [f"\u2705 Reloaded **{len(reloaded)}** extension(s)."]
+        # Resync the application command tree so newly added slash commands
+        # become visible to Discord clients without requiring a full restart.
+        synced_count = 0
+        try:
+            if self.config.dev_guild_id:
+                guild_obj = discord.Object(id=self.config.dev_guild_id)
+                self.bot.tree.copy_global_to(guild=guild_obj)
+                synced = await self.bot.tree.sync(guild=guild_obj)
+            else:
+                synced = await self.bot.tree.sync()
+            synced_count = len(synced)
+        except Exception as exc:
+            errors.append(f"Command sync failed: {exc}")
+            logger.exception("Slash command sync failed during /reload_ctfbot")
+
+        lines = [
+            f"\u2705 Reloaded **{len(reloaded)}** extension(s).",
+            f"\U0001f504 Synced **{synced_count}** slash command(s).",
+        ]
         if errors:
             lines.append("\n**Errors:**")
             lines.extend(errors)
@@ -591,13 +747,48 @@ class AdminCog(commands.Cog):
         async with get_session() as session:
             await audit.log_action(
                 session, interaction.guild.id, interaction.user.id,
-                "reload_ctfbot", f"Reloaded {len(reloaded)}, errors {len(errors)}",
+                "reload_ctfbot",
+                f"Reloaded {len(reloaded)}, synced {synced_count}, errors {len(errors)}",
             )
 
-        await send_log(interaction.guild, interaction.user, "reload_ctfbot", "Reloaded bot extensions")
+        await send_log(
+            interaction.guild, interaction.user, "reload_ctfbot",
+            f"Reloaded extensions and synced {synced_count} commands",
+        )
 
         await interaction.followup.send(
             embed=success_embed("\n".join(lines)), ephemeral=True
+        )
+
+    # \u2500\u2500 /sync_commands \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+
+    @app_commands.command(
+        name="sync_commands",
+        description="Force-resync slash commands with Discord (admin only)",
+    )
+    async def sync_commands(self, interaction: discord.Interaction):
+        if not is_admin(interaction, self.config):
+            await interaction.response.send_message(
+                embed=error_embed("Admin permission required."), ephemeral=True
+            )
+            return
+        await interaction.response.defer(ephemeral=True)
+        try:
+            if self.config.dev_guild_id:
+                guild_obj = discord.Object(id=self.config.dev_guild_id)
+                self.bot.tree.copy_global_to(guild=guild_obj)
+                synced = await self.bot.tree.sync(guild=guild_obj)
+            else:
+                synced = await self.bot.tree.sync()
+        except Exception as exc:
+            logger.exception("Slash command sync failed")
+            await interaction.followup.send(
+                embed=error_embed(f"Sync failed: {exc}"), ephemeral=True
+            )
+            return
+        await interaction.followup.send(
+            embed=success_embed(f"Synced **{len(synced)}** slash command(s) with Discord."),
+            ephemeral=True,
         )
 
 

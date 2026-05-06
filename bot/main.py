@@ -67,8 +67,6 @@ class CTFBot(commands.Bot):
         self._scheduler = CTFScheduler(
             self,
             interval_minutes=self.config.scheduler_interval_minutes,
-            announcement_channel=self.config.announcement_channel or None,
-            ctftime_cache_ttl=self.config.ctftime_cache_ttl,
             team_role_name=self.config.team_role_name,
         )
         self._scheduler.start()

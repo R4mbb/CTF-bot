@@ -10,7 +10,9 @@ from discord.ext import commands
 from bot.config import Config
 from bot.db import get_session
 from bot.services import ctf_service, audit
+from bot.services.announcement import refresh_announcement_member_count
 from bot.services.discord_service import (
+    assign_ctf_role,
     create_challenge_channel,
     create_init_channel,
     delete_init_channel,
@@ -19,6 +21,8 @@ from bot.services.discord_service import (
     get_team_role,
     grant_user_access,
     mark_channel_solved,
+    reorder_ctf_channels,
+    revoke_ctf_role,
     revoke_user_access,
 )
 from bot.services.discord_log import send_log
@@ -29,6 +33,7 @@ from bot.utils.embeds import (
     ctf_embed,
     ctf_list_embed,
     error_embed,
+    leaderboard_embed,
     success_embed,
 )
 
@@ -48,6 +53,36 @@ async def _ctf_name_autocomplete(
         for c in ctfs
         if current.lower() in c.name.lower()
     ][:25]
+
+
+async def _resolve_ctf(
+    session, guild_id: int, ctf_name: str | None, channel: discord.abc.GuildChannel | None
+):
+    """Resolve a CTF by explicit name, or fall back to the channel's category.
+
+    Returns ``(ctf, error_message)``. On success ``error_message`` is ``None``;
+    when neither path resolves a CTF, ``ctf`` is ``None`` and the error message
+    explains how to recover.
+    """
+    if ctf_name:
+        ctf = await ctf_service.get_ctf_by_name(session, guild_id, ctf_name)
+        if ctf is None:
+            return None, f"CTF **{ctf_name}** not found."
+        return ctf, None
+
+    category = getattr(channel, "category", None)
+    if category is None:
+        return None, (
+            "Run this from inside a CTF category channel, "
+            "or pass `ctf_name` explicitly."
+        )
+    ctf = await ctf_service.get_ctf_by_category(session, guild_id, category.id)
+    if ctf is None:
+        return None, (
+            f"Channel **#{getattr(channel, 'name', '?')}** is not in a CTF category. "
+            "Pass `ctf_name` explicitly."
+        )
+    return ctf, None
 
 
 async def _challenge_category_autocomplete(
@@ -88,9 +123,11 @@ HELP_EMBED.add_field(
 HELP_EMBED.add_field(
     name="\U0001f3af  Challenge Tracking",
     value=(
-        "`/add_challenge <ctf> <category> <name>` \u2014 Add a challenge\n"
-        "`/solve_challenge <ctf> <category> <name>` \u2014 Mark as solved\n"
-        "`/list_challenges <ctf_name>` \u2014 View challenge scoreboard"
+        "`/add_challenge <category> <name>` \u2014 Add a challenge "
+        "(CTF inferred from the channel's category; `ctf_name` is optional)\n"
+        "`/solve_challenge <category> <name>` \u2014 Mark as solved\n"
+        "`/list_challenges <ctf_name>` \u2014 View challenge scoreboard\n"
+        "`/leaderboard [ctf_name]` \u2014 Per-user ranking by points & solves"
     ),
     inline=False,
 )
@@ -119,7 +156,9 @@ HELP_EMBED.add_field(
         "\u2022 All CTF/category names support **autocomplete** \u2014 just start typing\n"
         "\u2022 Challenge categories (web, pwn, crypto...) also autocomplete\n"
         "\u2022 `/create_ctf_from_ctftime` uses the number from `/upcoming_ctfs_week`\n"
-        "\u2022 After a CTF is created, a **Join** button appears in announcements"
+        "\u2022 After a CTF is created, a **Join** button appears in announcements\n"
+        "\u2022 `/leaderboard` ranks by **/solve_challenge timestamps** \u2014 "
+        "run it right after submitting your flag for accurate First Blood / order"
     ),
     inline=False,
 )
@@ -309,14 +348,27 @@ class UserCog(commands.Cog):
                 )
                 return
 
-            if ctf.category_id:
-                category = guild.get_channel(ctf.category_id)
-                if isinstance(category, discord.CategoryChannel):
-                    await grant_user_access(category, member)
+            ctf_role_id = ctf.role_id
+            ctf_category_id = ctf.category_id
 
             await audit.log_action(
                 session, guild.id, member.id, "join_ctf", f"Joined CTF '{ctf_name}'"
             )
+
+        # Prefer the per-CTF role (new CTFs); fall back to per-member
+        # overwrites for legacy CTFs that were created before role support.
+        ctf_role = guild.get_role(ctf_role_id) if ctf_role_id else None
+        if ctf_role is not None:
+            await assign_ctf_role(member, ctf_role)
+        elif ctf_category_id:
+            category = guild.get_channel(ctf_category_id)
+            if isinstance(category, discord.CategoryChannel):
+                await grant_user_access(category, member)
+
+        async with get_session() as session:
+            refreshed = await ctf_service.get_ctf_by_name(session, guild.id, ctf_name)
+            if refreshed is not None:
+                await refresh_announcement_member_count(guild, refreshed, session)
 
         await send_log(guild, member, "join_ctf", f"Joined **{ctf_name}**")
 
@@ -354,14 +406,25 @@ class UserCog(commands.Cog):
                 )
                 return
 
-            if ctf.category_id:
-                category = guild.get_channel(ctf.category_id)
-                if isinstance(category, discord.CategoryChannel):
-                    await revoke_user_access(category, member)
+            ctf_role_id = ctf.role_id
+            ctf_category_id = ctf.category_id
 
             await audit.log_action(
                 session, guild.id, member.id, "leave_ctf", f"Left CTF '{ctf_name}'"
             )
+
+        ctf_role = guild.get_role(ctf_role_id) if ctf_role_id else None
+        if ctf_role is not None:
+            await revoke_ctf_role(member, ctf_role)
+        elif ctf_category_id:
+            category = guild.get_channel(ctf_category_id)
+            if isinstance(category, discord.CategoryChannel):
+                await revoke_user_access(category, member)
+
+        async with get_session() as session:
+            refreshed = await ctf_service.get_ctf_by_name(session, guild.id, ctf_name)
+            if refreshed is not None:
+                await refresh_announcement_member_count(guild, refreshed, session)
 
         await send_log(guild, member, "leave_ctf", f"Left **{ctf_name}**")
 
@@ -373,9 +436,9 @@ class UserCog(commands.Cog):
 
     @app_commands.command(name="add_challenge", description="Add a challenge to a CTF")
     @app_commands.describe(
-        ctf_name="CTF name",
         challenge_category="Category (e.g. web, pwn, crypto, rev, misc)",
         challenge_name="Challenge name",
+        ctf_name="CTF name (optional — inferred from the channel's category if omitted)",
         points="Points (optional)",
         challenge_url="Challenge URL (optional)",
         notes="Notes (optional)",
@@ -387,9 +450,9 @@ class UserCog(commands.Cog):
     async def add_challenge(
         self,
         interaction: discord.Interaction,
-        ctf_name: str,
         challenge_category: str,
         challenge_name: str,
+        ctf_name: str | None = None,
         points: int | None = None,
         challenge_url: str | None = None,
         notes: str | None = None,
@@ -397,13 +460,16 @@ class UserCog(commands.Cog):
         guild = interaction.guild
         assert guild
 
-        await interaction.response.defer()
+        # Ephemeral so the bot doesn't pollute #general (or whichever channel
+        # the user invoked from); the public record lives in #challenge-log.
+        await interaction.response.defer(ephemeral=True)
 
         async with get_session() as session:
-            ctf = await ctf_service.get_ctf_by_name(session, guild.id, ctf_name)
-            if not ctf:
-                await interaction.followup.send(embed=error_embed(f"CTF **{ctf_name}** not found."))
+            ctf, err = await _resolve_ctf(session, guild.id, ctf_name, interaction.channel)
+            if ctf is None:
+                await interaction.followup.send(embed=error_embed(err), ephemeral=True)
                 return
+            ctf_name = ctf.name
 
             chall = await ctf_service.add_challenge(
                 session,
@@ -420,8 +486,12 @@ class UserCog(commands.Cog):
                     embed=error_embed(
                         f"Challenge **[{challenge_category.upper()}] {challenge_name}** already exists."
                     ),
+                    ephemeral=True,
                 )
                 return
+
+            challenge_id = chall.id
+            ctf_category_id = ctf.category_id
 
             await audit.log_action(
                 session, guild.id, interaction.user.id, "add_challenge",
@@ -434,18 +504,20 @@ class UserCog(commands.Cog):
             added_by=interaction.user.display_name,
             notes=notes,
         )
-        await interaction.followup.send(embed=embed)
 
         await send_log(
             guild, interaction.user, "add_challenge",
             f"Added **[{challenge_category.upper()}] {challenge_name}** to {ctf_name}",
         )
 
-        # Create challenge channel + post to challenge-log
-        if ctf.category_id:
-            category = guild.get_channel(ctf.category_id)
+        # Create challenge channel + post the embed only to challenge-log
+        created_channel: discord.TextChannel | None = None
+        if ctf_category_id:
+            category = guild.get_channel(ctf_category_id)
             if isinstance(category, discord.CategoryChannel):
-                await create_challenge_channel(category, challenge_category, challenge_name)
+                created_channel = await create_challenge_channel(
+                    category, challenge_category, challenge_name
+                )
 
                 log_ch = get_channel_by_name(category, "challenge-log")
                 if log_ch:
@@ -454,13 +526,28 @@ class UserCog(commands.Cog):
                     except discord.HTTPException:
                         pass
 
+                await reorder_ctf_channels(category, self.config.default_channels)
+
+        if created_channel is not None:
+            async with get_session() as session:
+                await ctf_service.set_challenge_channel(
+                    session, challenge_id, created_channel.id
+                )
+
+        await interaction.followup.send(
+            embed=success_embed(
+                f"Challenge **[{challenge_category.upper()}] {challenge_name}** added to **{ctf_name}**."
+            ),
+            ephemeral=True,
+        )
+
     # ── /solve_challenge ──────────────────────────────────────────────────
 
     @app_commands.command(name="solve_challenge", description="Mark a challenge as solved")
     @app_commands.describe(
-        ctf_name="CTF name",
         challenge_category="Challenge category",
         challenge_name="Challenge name",
+        ctf_name="CTF name (optional — inferred from the channel's category if omitted)",
         flag="Flag (optional, stored for reference)",
         writeup_url="Writeup URL (optional)",
         notes="Notes (optional)",
@@ -472,9 +559,9 @@ class UserCog(commands.Cog):
     async def solve_challenge(
         self,
         interaction: discord.Interaction,
-        ctf_name: str,
         challenge_category: str,
         challenge_name: str,
+        ctf_name: str | None = None,
         flag: str | None = None,
         writeup_url: str | None = None,
         notes: str | None = None,
@@ -482,13 +569,15 @@ class UserCog(commands.Cog):
         guild = interaction.guild
         assert guild
 
-        await interaction.response.defer()
+        # Ephemeral: keep #general clean — embed is posted to #challenge-log.
+        await interaction.response.defer(ephemeral=True)
 
         async with get_session() as session:
-            ctf = await ctf_service.get_ctf_by_name(session, guild.id, ctf_name)
-            if not ctf:
-                await interaction.followup.send(embed=error_embed(f"CTF **{ctf_name}** not found."))
+            ctf, err = await _resolve_ctf(session, guild.id, ctf_name, interaction.channel)
+            if ctf is None:
+                await interaction.followup.send(embed=error_embed(err), ephemeral=True)
                 return
+            ctf_name = ctf.name
 
             chall = await ctf_service.get_challenge(
                 session, ctf.id, challenge_category, challenge_name
@@ -497,13 +586,14 @@ class UserCog(commands.Cog):
                 await interaction.followup.send(
                     embed=error_embed(
                         f"Challenge **[{challenge_category.upper()}] {challenge_name}** not found."
-                    )
+                    ),
+                    ephemeral=True,
                 )
                 return
 
             if chall.solved:
                 await interaction.followup.send(
-                    embed=error_embed("This challenge is already solved.")
+                    embed=error_embed("This challenge is already solved."), ephemeral=True
                 )
                 return
 
@@ -515,33 +605,50 @@ class UserCog(commands.Cog):
                 writeup_url=writeup_url,
                 notes=notes,
             )
+            if solve is None:
+                # Either a sequential retry or the loser of a concurrent race —
+                # either way, this user already has a solve row for this challenge.
+                await interaction.followup.send(
+                    embed=error_embed(
+                        f"You already recorded a solve for "
+                        f"**[{challenge_category.upper()}] {challenge_name}**."
+                    ),
+                    ephemeral=True,
+                )
+                return
 
             await audit.log_action(
                 session, guild.id, interaction.user.id, "solve_challenge",
                 f"Solved [{challenge_category}] {challenge_name} in '{ctf_name}'",
             )
 
+            chall_channel_id = chall.channel_id
+            chall_points = chall.points
+            ctf_category_id = ctf.category_id
+
         embed = challenge_solved_embed(
             challenge_name,
             challenge_category,
             ctf_name,
             solver=interaction.user.display_name,
-            points=chall.points,
+            points=chall_points,
             writeup_url=writeup_url,
             notes=notes,
         )
-        await interaction.followup.send(embed=embed)
 
         await send_log(
             guild, interaction.user, "solve_challenge",
             f"Solved **[{challenge_category.upper()}] {challenge_name}** in {ctf_name}",
         )
 
-        # Rename challenge channel to ✅ prefix + post to challenge-log
-        if ctf.category_id:
-            category = guild.get_channel(ctf.category_id)
+        # Rename challenge channel to ✅ prefix + post embed only to challenge-log
+        if ctf_category_id:
+            category = guild.get_channel(ctf_category_id)
             if isinstance(category, discord.CategoryChannel):
-                await mark_channel_solved(category, challenge_category, challenge_name)
+                await mark_channel_solved(
+                    category, challenge_category, challenge_name,
+                    channel_id=chall_channel_id,
+                )
 
                 log_ch = get_channel_by_name(category, "challenge-log")
                 if log_ch:
@@ -549,6 +656,15 @@ class UserCog(commands.Cog):
                         await log_ch.send(embed=embed)
                     except discord.HTTPException:
                         pass
+
+                await reorder_ctf_channels(category, self.config.default_channels)
+
+        await interaction.followup.send(
+            embed=success_embed(
+                f"Challenge **[{challenge_category.upper()}] {challenge_name}** marked as solved."
+            ),
+            ephemeral=True,
+        )
 
     # ── /list_ctfs ────────────────────────────────────────────────────────
 
@@ -594,6 +710,69 @@ class UserCog(commands.Cog):
         solved = sum(1 for c in challenges if c.solved)
         embed = challenge_list_embed(ctf_name, challenges, len(challenges), solved)
         await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    # ── /leaderboard ──────────────────────────────────────────────────────
+
+    @app_commands.command(
+        name="leaderboard",
+        description="Per-user solve leaderboard for a CTF (posts to #scoreboard)",
+    )
+    @app_commands.describe(
+        ctf_name="CTF name (optional — inferred from the channel's category if omitted)",
+    )
+    @app_commands.autocomplete(ctf_name=_ctf_name_autocomplete)
+    async def leaderboard(
+        self, interaction: discord.Interaction, ctf_name: str | None = None
+    ):
+        guild = interaction.guild
+        assert guild
+
+        # Defer first — DB aggregation + channel post can exceed Discord's
+        # 3-second initial response window on busy guilds.
+        await interaction.response.defer(ephemeral=True)
+
+        async with get_session() as session:
+            ctf, err = await _resolve_ctf(session, guild.id, ctf_name, interaction.channel)
+            if ctf is None:
+                await interaction.followup.send(embed=error_embed(err), ephemeral=True)
+                return
+
+            rows = await ctf_service.get_leaderboard(session, ctf.id)
+            member_count = await ctf_service.get_member_count(session, ctf.id)
+            achievements = await ctf_service.get_achievements(session, ctf.id)
+            resolved_name = ctf.name
+            ctf_category_id = ctf.category_id
+
+        embed = leaderboard_embed(
+            resolved_name,
+            rows,
+            member_count=member_count,
+            achievements=achievements,
+        )
+
+        # Post publicly to the CTF's #scoreboard channel when available so the
+        # whole team sees the live ranking; reply ephemerally either way.
+        scoreboard_ch: discord.TextChannel | None = None
+        if ctf_category_id:
+            category = guild.get_channel(ctf_category_id)
+            if isinstance(category, discord.CategoryChannel):
+                scoreboard_ch = get_channel_by_name(category, "scoreboard")
+
+        if scoreboard_ch is not None:
+            try:
+                await scoreboard_ch.send(embed=embed)
+                await interaction.followup.send(
+                    embed=success_embed(
+                        f"Leaderboard posted to {scoreboard_ch.mention}."
+                    ),
+                    ephemeral=True,
+                )
+                return
+            except discord.HTTPException:
+                logger.warning("Failed to post leaderboard to #scoreboard; replying inline")
+
+        # Fallback: no #scoreboard channel (or post failed) — show inline ephemerally.
+        await interaction.followup.send(embed=embed, ephemeral=True)
 
     # ── /ctf_info ─────────────────────────────────────────────────────────
 
