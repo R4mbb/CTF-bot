@@ -87,3 +87,4 @@ tmp/
 # Claude Code
 .claude/
 CLAUDE.local.md
+CLAUDE.md
